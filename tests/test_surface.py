@@ -76,3 +76,16 @@ def test_cli_writes_parting_surface(tmp_path):
     assert rd.ReadFile(str(tmp_path / "parting_surface.step")) == IFSelect_RetDone
     rd.TransferRoots()
     assert indexed_map(rd.OneShape(), TopAbs_FACE).Extent() == 8
+
+
+def test_self_intersection_check_is_fast_at_oblique_pull():
+    # the exact OCC check took ~280 s here; the mesh check must stay quick
+    import time
+
+    pull = (0.204547, 0.164121, 0.965)
+    n = math.sqrt(sum(c * c for c in pull))
+    model, result = run("hub_blades", pull=tuple(c / n for c in pull))
+    t0 = time.perf_counter()
+    s = parting_surface(model, result, "sweep", 20.0)
+    assert time.perf_counter() - t0 < 30.0
+    assert s.self_intersections > 0

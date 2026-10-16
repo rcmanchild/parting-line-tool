@@ -19,8 +19,6 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-from OCP.BOPAlgo import BOPAlgo_CheckStatus
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Check
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
@@ -40,6 +38,7 @@ from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
 from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt, gp_Vec
 
 from .occ import indexed_map, make_compound, map_list, orthonormal_basis, pnt
+from .undercut import mesh_arrays
 
 MODES = ("sweep", "ruled")
 
@@ -54,7 +53,7 @@ class SurfaceResult:
     outer_loops: list[int]
     filled_loops: list[int]
     self_intersections: int
-    touching: int                # boundary contacts that are not crossings
+    touching: int                # boundary contacts that are not crossings (not counted: 0)
     height: float | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -73,7 +72,7 @@ class SurfaceResult:
         }
 
     def summary_line(self) -> str:
-        si = (f"{self.self_intersections} self-intersection(s)  ** check **" if self.self_intersections
+        si = (f"{self.self_intersections} self-intersecting face pair(s)  ** check **" if self.self_intersections
               else "no self-intersections")
         return (f"Surface : {self.mode} {self.distance:g} mm, {self.faces} face(s), {self.area:.1f} mm2, "
                 f"{len(self.filled_loops)} hole(s) capped, {si}")
@@ -210,31 +209,88 @@ def parting_surface(model, result, mode: str = "sweep", distance: float = 20.0,
     BRepGProp.SurfaceProperties_s(shape, props, 1e-4)
     n_si, n_touch = 0, 0
     if check:
-        n_si, n_touch = _self_intersections(shape)
+        n_si, n_touch = _self_intersections(shape, model.diag)
         if n_si:
-            warnings.append(f"parting surface intersects itself in {n_si} place(s); "
+            warnings.append(f"parting surface intersects itself ({n_si} crossing face pair(s)); "
                             "reduce the distance or use the other mode")
     return SurfaceResult(shape, mode, distance, indexed_map(shape, TopAbs_FACE).Extent(), abs(props.Mass()),
                          [i + 1 for i in outer], [i + 1 for i in holes], n_si, n_touch, plane_h, warnings)
 
 
-def _self_intersections(shape) -> tuple[int, int]:
-    """(face intersections, touching contacts).  Only interferences that
-    involve a face count as self-intersections; vertex/vertex and edge/edge
-    contacts are unmerged boundaries that merely touch."""
-    chk = BRepAlgoAPI_Check(shape, False, True)
-    if chk.IsValid():
+def _self_intersections(shape, diag: float) -> tuple[int, int]:
+    """(face pairs that cross each other, 0).
+
+    Checked on a triangulation: OpenCascade's exact BRepAlgoAPI_Check takes
+    minutes on swept B-spline strips at oblique pulls.  Triangle pairs that
+    share a vertex (neighbours along a sewn edge) only touch and are skipped;
+    a crossing is an edge of one triangle passing through the interior of the
+    other."""
+    faces = map_list(indexed_map(shape, TopAbs_FACE), "face")
+    V, T, owner = mesh_arrays(shape, faces, max(1e-3 * diag, 1e-3), 0.3)
+    if len(T) < 2:
         return 0, 0
-    n_face, n_touch = 0, 0
-    for res in chk.Result():
-        if res.GetCheckStatus() != BOPAlgo_CheckStatus.BOPAlgo_SelfIntersect:
-            continue
-        kinds = {x.ShapeType() for x in res.GetFaultyShapes1()} | {x.ShapeType() for x in res.GetFaultyShapes2()}
-        if TopAbs_FACE in kinds:
-            n_face += 1
-        else:
-            n_touch += 1
-    return n_face, n_touch
+    q = max(1e-6 * diag, 1e-7)
+    # merge coincident mesh nodes (each face is meshed with its own nodes)
+    _, first, vid = np.unique(np.round(V / q).astype(np.int64), axis=0,
+                              return_index=True, return_inverse=True)
+    T = vid.reshape(-1)[T]
+    P = V[first]
+    A, B, C = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    lo = np.minimum(np.minimum(A, B), C)
+    hi = np.maximum(np.maximum(A, B), C)
+    pairs = _bbox_pairs(lo, hi)
+    if not len(pairs):
+        return 0, 0
+    i, j = pairs[:, 0], pairs[:, 1]
+    shared = (T[i][:, :, None] == T[j][:, None, :]).any(axis=(1, 2))
+    i, j = i[~shared], j[~shared]
+    eps = 1e-6
+    hit = np.zeros(len(i), dtype=bool)
+    for a, b in ((i, j), (j, i)):
+        for k in range(3):
+            p0, p1 = P[T[a, k]], P[T[a, (k + 1) % 3]]
+            hit |= _segment_crosses(p0, p1, A[b], B[b], C[b], eps)
+    fp = {tuple(sorted((int(owner[x]), int(owner[y])))) for x, y in zip(i[hit], j[hit])}
+    return len(fp), 0
+
+
+def _bbox_pairs(lo: np.ndarray, hi: np.ndarray, chunk: int = 2_000_000) -> np.ndarray:
+    """Index pairs (i < j) of overlapping boxes: sweep along x, then test y and z."""
+    order = np.argsort(lo[:, 0])
+    lo, hi = lo[order], hi[order]
+    # boxes j > i overlap i in x while lo_x[j] <= hi_x[i]
+    stop = np.searchsorted(lo[:, 0], hi[:, 0], side="right")
+    counts = np.maximum(stop - np.arange(len(lo)) - 1, 0)
+    out = []
+    i0 = 0
+    while i0 < len(lo):
+        csum = np.cumsum(counts[i0:])
+        i1 = i0 + max(1, int(np.searchsorted(csum, chunk)))
+        c = counts[i0:i1]
+        i = np.repeat(np.arange(i0, i1), c)
+        start = np.repeat(np.cumsum(c) - c, c)
+        j = i + 1 + (np.arange(len(i)) - start)
+        ok = ((lo[i, 1:] <= hi[j, 1:]) & (lo[j, 1:] <= hi[i, 1:])).all(axis=1)
+        out.append(np.stack([order[i[ok]], order[j[ok]]], axis=1))
+        i0 = i1
+    return np.vstack(out) if out else np.zeros((0, 2), dtype=np.int64)
+
+
+def _segment_crosses(p0, p1, a, b, c, eps: float) -> np.ndarray:
+    """Does segment p0-p1 pass through the interior of triangle abc (vectorised)?"""
+    d = p1 - p0
+    e1, e2 = b - a, c - a
+    h = np.cross(d, e2)
+    det = (e1 * h).sum(axis=1)
+    ok = np.abs(det) > 1e-14 * (np.linalg.norm(e1, axis=1) * np.linalg.norm(e2, axis=1) *
+                                np.linalg.norm(d, axis=1) + 1e-300)
+    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    s = p0 - a
+    u = (s * h).sum(axis=1) * inv
+    qv = np.cross(s, e1)
+    v = (d * qv).sum(axis=1) * inv
+    t = (e2 * qv).sum(axis=1) * inv
+    return ok & (u > eps) & (v > eps) & (u + v < 1 - eps) & (t > eps) & (t < 1 - eps)
 
 
 def _outward(tangent: np.ndarray, orient: float, e1, e2) -> np.ndarray | None:
