@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+fixtures/generated/
+*_parting/
+
+# real parts dropped into fixtures/ stay local (proprietary designs);
+# their small .json sidecars (pull direction) are fine to share
+fixtures/*.stp
+fixtures/*.step
+fixtures/*.STP
+fixtures/*.STEP
+
+# generated results (contain geometry derived from real parts)
+phase1_results/
