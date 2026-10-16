@@ -4,6 +4,7 @@
     partingline analyze part.step --auto --formats all
     partingline auto part.step             # rank pull directions only
     partingline faces part.step            # list faces, to pick --pull-face
+    partingline view part.step --pull +Z   # interactive viewer
 """
 
 from __future__ import annotations
@@ -123,11 +124,56 @@ def cmd_faces(args) -> int:
     return 0
 
 
+def cmd_view(args) -> int:
+    from .viewer import Viewer, ViewState  # noqa: PLC0415  (VTK only when viewing)
+
+    model = load_model(args.step, do_heal=not args.no_heal, gap_tol=args.gap_tol)
+    state = ViewState(pull=np.array([0.0, 0.0, 1.0]), opts=_options(args), split=args.split,
+                      formats=tuple(args.formats), outdir=args.out)
+    viewer = Viewer(model, state, size=tuple(args.size), offscreen=args.screenshot is not None)
+    if args.auto:
+        cands = viewer.run_auto()
+        if not 1 <= args.auto_pick <= len(cands):
+            raise ValueError(f"--auto-pick must be between 1 and {len(cands)}")
+        d = cands[args.auto_pick - 1].d
+    elif args.pull_face is not None:
+        d, _ = pull_from_face(model, args.pull_face)
+    else:
+        d = parse_pull(args.pull)
+    state.pull = -d if args.flip else d
+    viewer.recompute()
+    viewer.reset_camera()
+    if args.screenshot is not None:
+        print(summary_text(model, viewer.result))
+        print(f"Wrote   : {viewer.screenshot(args.screenshot)}")
+    else:
+        viewer.show()
+    return 0
+
+
 def _add_auto(p: argparse.ArgumentParser) -> None:
     p.add_argument("--auto-samples", type=int, default=500, metavar="N", help="directions to try (default 500)")
     p.add_argument("--auto-top", type=int, default=5, metavar="N", help="how many to show (default 5)")
     p.add_argument("--auto-undercut-weight", type=float, default=1.0, metavar="W",
                    help="score = W x undercut area + near-zero-draft area (default 1)")
+
+
+def _add_analysis(a: argparse.ArgumentParser) -> None:
+    a.add_argument("--flip", action="store_true", help="reverse the pull direction")
+    a.add_argument("--draft-tol", type=float, default=0.5, metavar="DEG",
+                   help="faces within this draft angle count as vertical (default 0.5)")
+    a.add_argument("--vertical", choices=VERTICAL_RULES, default="top",
+                   help="where the line goes on vertical bands (default top, toward +pull)")
+    a.add_argument("--gap-tol", type=float, default=0.01, metavar="MM", help="chaining gap tolerance (default 0.01)")
+    a.add_argument("--bridge-tol", type=float, default=0.5, metavar="MM",
+                   help="close remaining gaps up to this length with reported straight bridges (default 0.5; 0 = off)")
+    a.add_argument("--no-undercut", action="store_true", help="skip the ray-cast undercut check")
+    a.add_argument("--undercut-frac", type=float, default=0.05,
+                   help="flag a face as undercut when this fraction of it is blocked (default 0.05)")
+    a.add_argument("--undercut-min-area", type=float, default=0.5, metavar="MM2",
+                   help="ignore undercuts smaller than this blocked area (default 0.5)")
+    a.add_argument("--low-draft", type=float, default=1.0, metavar="DEG",
+                   help="report area with draft below this angle (default 1.0)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,14 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="rank pull directions (score = undercut area + near-zero-draft area) and use the best")
     _add_auto(a)
     a.add_argument("--auto-pick", type=int, default=1, metavar="N", help="with --auto, use rank N (default 1)")
-    a.add_argument("--flip", action="store_true", help="reverse the pull direction")
-    a.add_argument("--draft-tol", type=float, default=0.5, metavar="DEG",
-                   help="faces within this draft angle count as vertical (default 0.5)")
-    a.add_argument("--vertical", choices=VERTICAL_RULES, default="top",
-                   help="where the line goes on vertical bands (default top, toward +pull)")
-    a.add_argument("--gap-tol", type=float, default=0.01, metavar="MM", help="chaining gap tolerance (default 0.01)")
-    a.add_argument("--bridge-tol", type=float, default=0.5, metavar="MM",
-                   help="close remaining gaps up to this length with reported straight bridges (default 0.5; 0 = off)")
+    _add_analysis(a)
     a.add_argument("--formats", type=_formats, default=["step"],
                    help="comma list of step,iges,dxf,csv (line), split (cavity/core face shells), "
                         "surface (parting surface), or 'all' (default step)")
@@ -163,13 +202,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sweep distance / rectangle margin (default 20)")
     a.add_argument("--surface-height", type=float, metavar="MM",
                    help="ruled mode: height of the rectangle plane along the pull (default: mean line height)")
-    a.add_argument("--no-undercut", action="store_true", help="skip the ray-cast undercut check")
-    a.add_argument("--undercut-frac", type=float, default=0.05,
-                   help="flag a face as undercut when this fraction of it is blocked (default 0.05)")
-    a.add_argument("--undercut-min-area", type=float, default=0.5, metavar="MM2",
-                   help="ignore undercuts smaller than this blocked area (default 0.5)")
-    a.add_argument("--low-draft", type=float, default=1.0, metavar="DEG",
-                   help="report area with draft below this angle (default 1.0)")
     a.set_defaults(func=cmd_analyze)
 
     r = sub.add_parser("auto", help="rank pull directions over a hemisphere and show the top ones")
@@ -178,6 +210,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--draft-tol", type=float, default=0.5, metavar="DEG")
     r.add_argument("--low-draft", type=float, default=1.0, metavar="DEG")
     r.set_defaults(func=cmd_auto)
+
+    v = sub.add_parser("view", help="interactive 3D viewer (or --screenshot for a PNG)")
+    _add_common(v)
+    g = v.add_mutually_exclusive_group()
+    g.add_argument("--pull", default="+Z", help="initial pull direction (default +Z)")
+    g.add_argument("--pull-face", type=int, metavar="N", help="initial pull from face N")
+    g.add_argument("--auto", action="store_true", help="start from the best --auto direction")
+    v.add_argument("--auto-pick", type=int, default=1, metavar="N", help="with --auto, use rank N")
+    _add_analysis(v)
+    v.add_argument("--split", action="store_true", help="start with cavity/core split colouring")
+    v.add_argument("--formats", type=_formats, default=["step", "split", "surface"],
+                   help="what key 'e' exports (default step,split,surface)")
+    v.add_argument("--out", type=Path, help="export directory for key 'e' (default <name>_parting)")
+    v.add_argument("--screenshot", type=Path, metavar="PNG", help="render offscreen to PNG and exit")
+    v.add_argument("--size", type=int, nargs=2, default=[1200, 850], metavar=("W", "H"))
+    v.set_defaults(func=cmd_view)
 
     f = sub.add_parser("faces", help="list faces with numbers, types and normals/axes")
     _add_common(f)
