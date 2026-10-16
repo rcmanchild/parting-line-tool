@@ -90,6 +90,10 @@ class BandSolver:
             n = 0
             for T in points:
                 seg, hit = self._generator(T, g, region, boundary)
+                if seg is None:
+                    # blocked from the other side (e.g. a through slot at an oblique
+                    # pull): the halves can divide along the generator behind T
+                    seg, hit = self._generator(T, -g, region, boundary, quiet=True)
                 if seg is not None:
                     gens.append(seg)
                     breaks.setdefault(hit[0], []).append(hit[1])
@@ -152,20 +156,28 @@ class BandSolver:
         return out
 
     # -- generators -----------------------------------------------------------
-    def _on_region(self, x: np.ndarray, region: set[int]):
-        """Normal of the region face containing x, or None."""
+    def _on_region(self, x: np.ndarray, region: set[int], strict: bool = True):
+        """Normal of the region face containing x, or None.  With strict=False
+        a point on a face's boundary (where the inside test is unreliable) counts."""
         for fi in region:
             fc = self.fcs[fi]
             proj = GeomAPI_ProjectPointOnSurf(pnt(x), BRep_Tool.Surface_s(fc.fwd))
             if proj.NbPoints() == 0 or proj.LowerDistance() > 10 * self.tol:
                 continue
             u, v = proj.LowerDistanceParameters()
-            if fc.inside(u, v):
+            if not strict or fc.inside(u, v):
                 return fc.point_normal(u, v)[1]
         return None
 
-    def _generator(self, T: np.ndarray, g: np.ndarray, region: set[int], boundary):
+    def _generator(self, T: np.ndarray, g: np.ndarray, region: set[int], boundary, quiet: bool = False):
         step = max(4.0 * self.eps_g, 1e-4 * self.model.diag)
+        # a face counted vertical within the draft tolerance is not exactly
+        # parallel to d: run the generator along d projected onto the face
+        n0 = self._on_region(T, region, strict=False)
+        if n0 is not None:
+            gt = g - float(g @ n0) * n0
+            if np.linalg.norm(gt) > 0.5:
+                g = gt / np.linalg.norm(gt)
         if self._on_region(T + step * g, region) is None:
             return None, None  # the band does not continue along g from T
         L = 2.0 * self.model.diag + 1.0
@@ -183,6 +195,8 @@ class BandSolver:
                 if lam > step * 0.5 and (best is None or lam < best[0]):
                     best = (lam, q, ec)
         if best is None:
+            if quiet:
+                return None, None
             self.warnings.append(f"generator from {np.round(T, 3).tolist()} found no band edge to end on")
             return None, None
         lam, q, ec = best
@@ -202,7 +216,7 @@ class BandSolver:
             return None, None
         on_edge = ec.c3.Value(t_hit)
         on_edge = np.array([on_edge.X(), on_edge.Y(), on_edge.Z()])
-        # keep the generator exactly parallel to d; its end is within the
+        # keep the generator exactly along g; its end is within the
         # extrema tolerance of the band edge, well inside the chaining gap
         end = T + float((on_edge - T) @ g) * g
         curve = GC_MakeSegment(pnt(T), pnt(end)).Value()

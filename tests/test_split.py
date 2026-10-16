@@ -61,3 +61,25 @@ def test_hub_blades_two_halves():
     from OCP.TopAbs import TopAbs_SHELL
     from partingline.occ import indexed_map
     assert indexed_map(shells["cavity"], TopAbs_SHELL).Extent() == 1
+
+
+# oblique pulls that used to fail (from scripts/stress_directions.py)
+OBLIQUE = [
+    # T-slot walls 0.17 deg off vertical: generators must follow the wall
+    ("tslot_block", (0.003, 0.737, -0.676)),
+    # blade silhouettes running almost along the blade edge leave slivers
+    ("hub_blades", (-0.889, -0.434, -0.147)),
+    ("hub_blades", (-0.178, -0.962, 0.206)),
+    ("hub_blades", (-0.265, 0.96, -0.093)),
+]
+
+
+@pytest.mark.parametrize("name,pull", OBLIQUE)
+def test_oblique_pull_closes_and_splits(name, pull):
+    n = math.sqrt(sum(c * c for c in pull))
+    model, result = run(name, pull=tuple(c / n for c in pull))
+    lp = result.stats["loops"]
+    assert lp["open"] == 0 and lp["junctions"] == 0
+    sp = split_and_assign(model, result)
+    assert sp.conflicts == []
+    assert sp.boundary_length["cavity"] == pytest.approx(lp["total_length"], rel=1e-3)

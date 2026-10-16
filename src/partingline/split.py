@@ -289,6 +289,10 @@ def split_and_assign(model: Model, result) -> SplitResult:
         for i in members:
             side[i] = s
 
+    n_moved = _settle_slivers(smodel, side, parting_edge, vote, area)
+    if n_moved:
+        warnings.append(f"{n_moved} small face(s) next to the parting line moved to the other half "
+                        "so the halves meet along the line")
     if n_off_line:
         warnings.append(f"{n_off_line} edge(s) off the parting line separate faces that face opposite ways "
                         "(small regions the line does not resolve)")
@@ -325,6 +329,57 @@ def _release_side(fc: FaceCtx, caster, rule: str, own: set[int]) -> int:
     if not down[0] and up[0]:
         return CORE_SIDE
     return CORE_SIDE if rule != "bottom" else CAVITY_SIDE
+
+
+def _settle_slivers(smodel: Model, side: list[int], parting_edge, vote, area,
+                    max_frac: float = 0.01, passes: int = 3) -> int:
+    """Move small faces whose boundary disagrees with the line to the other half.
+
+    Where a silhouette runs almost along a model edge the splitter leaves thin
+    slivers between the two curves; the flood fill can put them on the wrong
+    side.  A face's mismatch is the length of its parting edges shared with a
+    same-side neighbour plus its non-parting edges shared with an other-side
+    neighbour; a small face is flipped when that strictly lowers it and its
+    own draft does not clearly say otherwise."""
+    lens = {}
+
+    def length(ei):
+        if ei not in lens:
+            e = smodel.edges[ei]
+            lens[ei] = 0.0 if BRep_Tool.Degenerated_s(e) else GCPnts_AbscissaPoint.Length_s(BRepAdaptor_Curve(e))
+        return lens[ei]
+
+    face_edges: dict[int, list[tuple[int, int]]] = {}
+    for ei, uses in enumerate(smodel.edge_uses):
+        if len(uses) != 2 or uses[0].face == uses[1].face:
+            continue
+        a, b = uses[0].face, uses[1].face
+        face_edges.setdefault(a, []).append((ei, b))
+        face_edges.setdefault(b, []).append((ei, a))
+    limit = max_frac * float(area.sum())
+    moved = 0
+    for _ in range(passes):
+        changed = False
+        for f, nbrs in face_edges.items():
+            if area[f] > limit:
+                continue
+            here = flipped = 0.0
+            for ei, g in nbrs:
+                same = side[f] == side[g]
+                if parting_edge[ei]:
+                    here += length(ei) * same
+                    flipped += length(ei) * (not same)
+                else:
+                    here += length(ei) * (not same)
+                    flipped += length(ei) * same
+            new = -side[f]
+            if flipped < here - 1e-9 and not (abs(vote[f]) > 0.5 and np.sign(vote[f]) != new):
+                side[f] = new
+                moved += 1
+                changed = True
+        if not changed:
+            break
+    return moved
 
 
 def _free_length(smodel: Model, faces: set[int]) -> float:
